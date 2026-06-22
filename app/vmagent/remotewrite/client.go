@@ -33,6 +33,14 @@ var (
 		"to the corresponding -remoteWrite.url . See https://docs.victoriametrics.com/victoriametrics/vmagent/#victoriametrics-remote-write-protocol")
 	forceVMProto = flagutil.NewArrayBool("remoteWrite.forceVMProto", "Whether to force VictoriaMetrics remote write protocol for sending data "+
 		"to the corresponding -remoteWrite.url . See https://docs.victoriametrics.com/victoriametrics/vmagent/#victoriametrics-remote-write-protocol")
+	// forcePromProtoV2 enables the experimental Prometheus Remote Write 2.0 emitter.
+	// When set, vmagent emits PRW v2 (Content-Type: application/x-protobuf;proto=io.prometheus.write.v2.Request,
+	// X-Prometheus-Remote-Write-Version: 2.0.0) instead of PRW v1.
+	// This is a PoC emitter — reliability (write-stats headers) and HELP/UNIT metadata are deferred.
+	// See: https://prometheus.io/docs/specs/prw/remote_write_spec_2_0/
+	forcePromProtoV2 = flagutil.NewArrayBool("remoteWrite.forcePromProtoV2", "Whether to force Prometheus Remote Write 2.0 protocol for sending data "+
+		"to the corresponding -remoteWrite.url. This is an experimental PoC emitter. "+
+		"See https://prometheus.io/docs/specs/prw/remote_write_spec_2_0/")
 
 	rateLimit = flagutil.NewArrayInt("remoteWrite.rateLimit", 0, "Optional rate limit in bytes per second for data sent to the corresponding -remoteWrite.url. "+
 		"By default, the rate limit is disabled. It can be useful for limiting load on remote storage when big amounts of buffered data "+
@@ -96,6 +104,10 @@ type client struct {
 	// Whether to use VictoriaMetrics remote write protocol for sending the data to remoteWriteURL
 	useVMProto          atomic.Bool
 	canDowngradeVMProto atomic.Bool
+
+	// Whether to use Prometheus Remote Write v2 protocol for sending data to remoteWriteURL.
+	// When true, useVMProto must be false.
+	usePromProtoV2 atomic.Bool
 
 	fq *persistentqueue.FastQueue
 	hc *http.Client
@@ -174,15 +186,24 @@ func newHTTPClient(argIdx int, remoteWriteURL, sanitizedURL string, fq *persiste
 
 	useVMProto := forceVMProto.GetOptionalArg(argIdx)
 	usePromProto := forcePromProto.GetOptionalArg(argIdx)
+	usePromProtoV2 := forcePromProtoV2.GetOptionalArg(argIdx)
 	if useVMProto && usePromProto {
 		logger.Fatalf("-remoteWrite.useVMProto and -remoteWrite.usePromProto cannot be set simultaneously for -remoteWrite.url=%s", sanitizedURL)
 	}
-	if !useVMProto && !usePromProto {
-		// The VM protocol could be downgraded later at runtime if unsupported media type response status is received.
-		useVMProto = true
-		c.canDowngradeVMProto.Store(true)
+	if usePromProtoV2 && (useVMProto || usePromProto) {
+		logger.Fatalf("-remoteWrite.forcePromProtoV2 cannot be combined with -remoteWrite.forceVMProto or -remoteWrite.forcePromProto for -remoteWrite.url=%s", sanitizedURL)
 	}
-	c.useVMProto.Store(useVMProto)
+	if usePromProtoV2 {
+		c.usePromProtoV2.Store(true)
+		c.useVMProto.Store(false)
+	} else {
+		if !useVMProto && !usePromProto {
+			// The VM protocol could be downgraded later at runtime if unsupported media type response status is received.
+			useVMProto = true
+			c.canDowngradeVMProto.Store(true)
+		}
+		c.useVMProto.Store(useVMProto)
+	}
 
 	return c
 }
@@ -396,11 +417,20 @@ func (c *client) newRequest(url string, body []byte) (*http.Request, error) {
 	}
 	h := req.Header
 	h.Set("User-Agent", "vmagent")
-	h.Set("Content-Type", "application/x-protobuf")
 	if encoding.IsZstd(body) {
+		// VictoriaMetrics remote write protocol (zstd-compressed)
+		h.Set("Content-Type", "application/x-protobuf")
 		h.Set("Content-Encoding", "zstd")
 		h.Set("X-VictoriaMetrics-Remote-Write-Version", "1")
+	} else if c.usePromProtoV2.Load() {
+		// Prometheus Remote Write 2.0 (snappy-compressed, v2 proto Content-Type)
+		// Spec: https://prometheus.io/docs/specs/prw/remote_write_spec_2_0/
+		h.Set("Content-Type", "application/x-protobuf;proto=io.prometheus.write.v2.Request")
+		h.Set("Content-Encoding", "snappy")
+		h.Set("X-Prometheus-Remote-Write-Version", "2.0.0")
 	} else {
+		// Prometheus Remote Write 1.0 (snappy-compressed)
+		h.Set("Content-Type", "application/x-protobuf")
 		h.Set("Content-Encoding", "snappy")
 		h.Set("X-Prometheus-Remote-Write-Version", "0.1.0")
 	}

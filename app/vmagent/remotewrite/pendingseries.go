@@ -8,6 +8,7 @@ import (
 
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/bytesutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/cgroup"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbv2"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/decimal"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/encoding/zstd"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/fasttime"
@@ -41,10 +42,11 @@ type pendingSeries struct {
 	periodicFlusherWG sync.WaitGroup
 }
 
-func newPendingSeries(fq *persistentqueue.FastQueue, isVMRemoteWrite *atomic.Bool, significantFigures, roundDigits int) *pendingSeries {
+func newPendingSeries(fq *persistentqueue.FastQueue, isVMRemoteWrite *atomic.Bool, isPromProtoV2 *atomic.Bool, significantFigures, roundDigits int) *pendingSeries {
 	var ps pendingSeries
 	ps.wr.fq = fq
 	ps.wr.isVMRemoteWrite = isVMRemoteWrite
+	ps.wr.isPromProtoV2 = isPromProtoV2
 	ps.wr.significantFigures = significantFigures
 	ps.wr.roundDigits = roundDigits
 	ps.stopCh = make(chan struct{})
@@ -106,6 +108,10 @@ type writeRequest struct {
 	// Whether to encode the write request with VictoriaMetrics remote write protocol.
 	isVMRemoteWrite *atomic.Bool
 
+	// Whether to encode the write request with Prometheus Remote Write 2.0 protocol.
+	// When true, isVMRemoteWrite must point to a false value.
+	isPromProtoV2 *atomic.Bool
+
 	// How many significant figures must be left before sending the writeRequest to fq.
 	significantFigures int
 
@@ -126,7 +132,7 @@ type writeRequest struct {
 }
 
 func (wr *writeRequest) reset() {
-	// Do not reset lastFlushTime, fq, isVMRemoteWrite, significantFigures and roundDigits, since they are reused.
+	// Do not reset lastFlushTime, fq, isVMRemoteWrite, isPromProtoV2, significantFigures and roundDigits, since they are reused.
 
 	wr.wr.Timeseries = nil
 	wr.wr.Metadata = nil
@@ -151,7 +157,7 @@ func (wr *writeRequest) reset() {
 func (wr *writeRequest) mustFlushOnStop() {
 	wr.wr.Timeseries = wr.tss
 	wr.wr.Metadata = wr.mms
-	if !tryPushWriteRequest(&wr.wr, wr.mustWriteBlock, wr.isVMRemoteWrite.Load()) {
+	if !tryPushWriteRequest(&wr.wr, wr.mustWriteBlock, wr.isVMRemoteWrite.Load(), wr.isPromProtoV2.Load()) {
 		logger.Panicf("BUG: final flush must always return true")
 	}
 	wr.reset()
@@ -166,7 +172,7 @@ func (wr *writeRequest) tryFlush() bool {
 	wr.wr.Timeseries = wr.tss
 	wr.wr.Metadata = wr.mms
 	wr.lastFlushTime.Store(fasttime.UnixTimestamp())
-	if !tryPushWriteRequest(&wr.wr, wr.fq.TryWriteBlock, wr.isVMRemoteWrite.Load()) {
+	if !tryPushWriteRequest(&wr.wr, wr.fq.TryWriteBlock, wr.isVMRemoteWrite.Load(), wr.isPromProtoV2.Load()) {
 		return false
 	}
 	wr.reset()
@@ -303,7 +309,7 @@ func (wr *writeRequest) copyTimeSeries(dst, src *prompb.TimeSeries) {
 // marshalConcurrency limits the maximum number of concurrent workers, which marshal and compress WriteRequest.
 var marshalConcurrencyCh = make(chan struct{}, cgroup.AvailableCPUs())
 
-func tryPushWriteRequest(wr *prompb.WriteRequest, tryPushBlock func(block []byte) bool, isVMRemoteWrite bool) bool {
+func tryPushWriteRequest(wr *prompb.WriteRequest, tryPushBlock func(block []byte) bool, isVMRemoteWrite bool, isPromProtoV2 bool) bool {
 	if wr.IsEmpty() {
 		// Nothing to push
 		return true
@@ -312,12 +318,18 @@ func tryPushWriteRequest(wr *prompb.WriteRequest, tryPushBlock func(block []byte
 	marshalConcurrencyCh <- struct{}{}
 
 	bb := writeRequestBufPool.Get()
-	bb.B = wr.MarshalProtobuf(bb.B[:0])
+	if isPromProtoV2 {
+		// Marshal using Prometheus Remote Write 2.0 format (string-interned symbols table).
+		bb.B = append(bb.B[:0], prompbv2.MarshalRequest(wr)...)
+	} else {
+		bb.B = wr.MarshalProtobuf(bb.B[:0])
+	}
 	if len(bb.B) <= maxUnpackedBlockSize.IntN() {
 		zb := compressBufPool.Get()
 		if isVMRemoteWrite {
 			zb.B = zstd.CompressLevel(zb.B[:0], bb.B, *vmProtoCompressLevel)
 		} else {
+			// Both PRW v1 and PRW v2 use snappy compression
 			zb.B = snappy.Encode(zb.B[:cap(zb.B)], bb.B)
 		}
 		writeRequestBufPool.Put(bb)
@@ -352,12 +364,12 @@ func tryPushWriteRequest(wr *prompb.WriteRequest, tryPushBlock func(block []byte
 		metadata := wr.Metadata
 		n := len(metadata) / 2
 		wr.Metadata = metadata[:n]
-		if !tryPushWriteRequest(wr, tryPushBlock, isVMRemoteWrite) {
+		if !tryPushWriteRequest(wr, tryPushBlock, isVMRemoteWrite, isPromProtoV2) {
 			wr.Metadata = metadata
 			return false
 		}
 		wr.Metadata = metadata[n:]
-		if !tryPushWriteRequest(wr, tryPushBlock, isVMRemoteWrite) {
+		if !tryPushWriteRequest(wr, tryPushBlock, isVMRemoteWrite, isPromProtoV2) {
 			wr.Metadata = metadata
 			return false
 		}
@@ -376,14 +388,14 @@ func tryPushWriteRequest(wr *prompb.WriteRequest, tryPushBlock func(block []byte
 		m := len(metaData) / 2
 		wr.Timeseries[0].Samples = samples[:n]
 		wr.Metadata = metaData[:m]
-		if !tryPushWriteRequest(wr, tryPushBlock, isVMRemoteWrite) {
+		if !tryPushWriteRequest(wr, tryPushBlock, isVMRemoteWrite, isPromProtoV2) {
 			wr.Timeseries[0].Samples = samples
 			wr.Metadata = metaData
 			return false
 		}
 		wr.Timeseries[0].Samples = samples[n:]
 		wr.Metadata = metaData[m:]
-		if !tryPushWriteRequest(wr, tryPushBlock, isVMRemoteWrite) {
+		if !tryPushWriteRequest(wr, tryPushBlock, isVMRemoteWrite, isPromProtoV2) {
 			wr.Timeseries[0].Samples = samples
 			wr.Metadata = metaData
 			return false
@@ -400,14 +412,14 @@ func tryPushWriteRequest(wr *prompb.WriteRequest, tryPushBlock func(block []byte
 		m := len(metaData) / 2
 		wr.Timeseries = timeseries[:n]
 		wr.Metadata = metaData[:m]
-		if !tryPushWriteRequest(wr, tryPushBlock, isVMRemoteWrite) {
+		if !tryPushWriteRequest(wr, tryPushBlock, isVMRemoteWrite, isPromProtoV2) {
 			wr.Timeseries = timeseries
 			wr.Metadata = metaData
 			return false
 		}
 		wr.Timeseries = timeseries[n:]
 		wr.Metadata = metaData[m:]
-		if !tryPushWriteRequest(wr, tryPushBlock, isVMRemoteWrite) {
+		if !tryPushWriteRequest(wr, tryPushBlock, isVMRemoteWrite, isPromProtoV2) {
 			wr.Timeseries = timeseries
 			wr.Metadata = metaData
 			return false

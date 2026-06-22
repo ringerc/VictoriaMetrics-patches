@@ -30,6 +30,7 @@ import (
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/procutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prommetadata"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompb"
+	"github.com/VictoriaMetrics/VictoriaMetrics/lib/prompbv2"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promrelabel"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/promutil"
 	"github.com/VictoriaMetrics/VictoriaMetrics/lib/ratelimiter"
@@ -416,6 +417,11 @@ func tryPush(at *auth.Token, wr *prompb.WriteRequest, forceDropSamplesOnFailure 
 		// Return true to the caller, so it doesn't re-send the samples again.
 		return true
 	}
+
+	// Update the PRW v2 global type registry before metadata and timeseries are separated.
+	// This allows MarshalRequest to resolve metric types at emit time even though metadata
+	// and timeseries are pushed through separate queue entries in v1.
+	prompbv2.UpdateTypeRegistry(mms)
 
 	// Push metadata separately from time series, since it doesn't need sharding,
 	// relabeling, stream aggregation, deduplication, etc.
@@ -970,7 +976,7 @@ func newRemoteWriteCtx(argIdx int, remoteWriteURL *url.URL, sanitizedURL string)
 	}
 	pss := make([]*pendingSeries, pssLen)
 	for i := range pss {
-		pss[i] = newPendingSeries(fq, &c.useVMProto, sf, rd)
+		pss[i] = newPendingSeries(fq, &c.useVMProto, &c.usePromProtoV2, sf, rd)
 	}
 
 	rwctx := &remoteWriteCtx{

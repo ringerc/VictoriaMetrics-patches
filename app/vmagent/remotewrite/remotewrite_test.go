@@ -84,7 +84,8 @@ func TestRemoteWriteContext_TryPushTimeSeries(t *testing.T) {
 		pss := make([]*pendingSeries, 1)
 		isVMProto := &atomic.Bool{}
 		isVMProto.Store(true)
-		pss[0] = newPendingSeries(fq, isVMProto, 0, 100)
+		isPromProtoV2 := &atomic.Bool{}
+		pss[0] = newPendingSeries(fq, isVMProto, isPromProtoV2, 0, 100)
 		rwctx := &remoteWriteCtx{
 			idx:                    0,
 			streamAggrKeepInput:    keepInput,
